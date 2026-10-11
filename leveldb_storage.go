@@ -68,7 +68,12 @@ func (x *LevelDBStorage) Capabilities() []storage.StorageCapability {
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
 		storage.CapabilityAtomicDelete,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *LevelDBStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *LevelDBStorage) Init(ctx context.Context) error {
@@ -127,10 +132,15 @@ func (x *LevelDBStorage) UpdateWithVersion(ctx context.Context, lockId string, e
 
 	// 读取当前版本
 	vKey := x.versionKey(lockId)
+	// 注意：key 不存在时映射为 ErrVersionMiss 而不是 ErrLockNotFound——core 的
+	// lockExpired/rlockReclaim 等抢占路径只把 ErrVersionMiss 当作"CAS 失败，可重试"，
+	// 其它错误会被当作硬错误直接返回。若真正的持有者恰好在这中间 DeleteWithVersion
+	// 真删了记录（与本次抢占竞态，casMu 只在单次调用内持锁，两次调用之间仍可能被其它
+	// goroutine 抢先），"记录不存在"和"版本不匹配"对调用方而言是同一件事，应该重试。
 	currentVersionBytes, err := x.db.Get([]byte(vKey), nil)
 	if err != nil {
 		if err == leveldb.ErrNotFound {
-			return storage_lock.ErrLockNotFound
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
